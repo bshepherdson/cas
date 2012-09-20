@@ -36,7 +36,7 @@ import Debug.Trace
 -- Assemble into binary rep and log label locations.
 -- Write completed binary rep, resolving labels from the dictionary as it goes.
 
-data Arg = Reg Word16 | RegAddr Word16 | LitAddr Word16 | LitAndReg Word16 Word16 | Lit Word16 | LabelUse String | LabelAddr String | Peek | Push | Pop | SP | PC | EX | Nil | Expr Arg String Arg
+data Arg = Reg Word16 | RegAddr Word16 | LitAddr Word16 | LitAndReg Word16 Word16 | Lit Word16 | LabelUse String | LabelAddr String | Peek | Push | Pop | Pick Word16 | SP | PC | EX | Nil
   deriving (Show)
 
 data Asm = LabelDef String
@@ -157,7 +157,7 @@ pExtOpcode =  try (string "JSR")
 
 
 -- several different kinds of arguments
-pArg = try pReg <|> try pRegAddr <|> try pLitAndReg <|> try pLitAddr <|> try pPeek <|> try pPush <|> try pPop <|> try pSP <|> try pPC <|> try pEX <|> try pLit <|> pLabelUse
+pArg = try pReg <|> try pRegAddr <|> try pLitAndReg <|> try pRegAndLit <|> try pLitAddr <|> try pPeek <|> try pPush <|> try pPop <|> try pPick <|> try pSP <|> try pPC <|> try pEX <|> try pLit <|> pLabelUse
 
 pReg = do
   r <- oneOf "ABCXYZIJ"
@@ -182,11 +182,30 @@ pLitAndReg = do
   char ']'
   return $ LitAndReg lit reg
 
+pRegAndLit = do
+  char '['
+  spaces
+  Reg reg <- pReg
+  spaces
+  char '+'
+  spaces
+  Lit lit <- pLit
+  spaces
+  char ']'
+  return $ LitAndReg lit reg
+
 pLitAddr = do
   content <- brackets (pLit <|> pLabelUse)
   case content of
     LabelUse label -> return $ LabelAddr label
     Lit lit -> return $ LitAddr lit
+
+pPick = do
+    string "PICK"
+    space
+    pWS
+    Lit lit <- pLit
+    return $ Pick lit
 
 pPeek = string "PEEK" >> return Peek
 pPush = string "PUSH" >> return Push
@@ -300,8 +319,9 @@ assembleArg (Lit w) | w <  0x1f   = (w + 0x21, []) -- inline literal
                     | otherwise   = (0x1f, [W w])  -- next word literal
 assembleArg (LabelUse label) = (0x1f, [LU label])
 assembleArg Pop  = (0x18, [])
+assembleArg Push = (0x18, [])
 assembleArg Peek = (0x19, [])
-assembleArg Push = (0x1a, [])
+assembleArg (Pick n) = (0x1a, [W n])
 assembleArg SP   = (0x1b, [])
 assembleArg PC   = (0x1c, [])
 assembleArg EX   = (0x1d, [])
