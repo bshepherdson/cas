@@ -67,7 +67,8 @@ pComment = pWS *> char ';' *> manyTill anyChar (try newline) *> pure [Blank]
 pDAT = do
     spaces
     string "DAT "
-    xs <- sepBy (try pASCII <|> pNumber <|> pLitLabel) (pWS >> char ',' >> pWS >> return ())
+    xs <- sepBy1 (pASCII <|> pNumber <|> pLitLabel) (try $ pWS >> char ',' >> pWS >> return ())
+    optional (try pComment)
     spaces
     return xs
   where pASCII = do
@@ -86,6 +87,7 @@ pLabel = do
   pWS
   char ':'
   l <- pl
+  optional (try pComment)
   return [LabelDef l]
 
 pInstr = try pRegInstr <|> pExtInstr
@@ -340,6 +342,7 @@ main = do
       [a, asmFile, outFile]    -> hPutStrLn stderr ("Unknown argument: " ++ a) >> exitWith (ExitFailure 1)
       [asmFile, outFile]       -> return (False, asmFile, outFile)
   asm <- parseFile asmFile
+  print asm
   let bin = buildBinary asm
       relocs = labelUses bin
       relocCount = genericLength relocs + 5
