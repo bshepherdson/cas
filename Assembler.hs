@@ -1,12 +1,9 @@
 {-# LANGUAGE GeneralizedNewtypeDeriving, ExistentialQuantification, BangPatterns, NoMonomorphismRestriction #-}
 
 -- An emulator for DCPU-16, the 16-bit virtual machine designed by Notch for 0x10c.
--- This is based on the specification version 1.1.
--- Added instructions:
--- DIE. Exits with the given code.
--- INP. Accepts a max length in A and buffer address as the argument, and writes bytes from standard input.
--- OUT. Writes the given byte to stdout.
--- HEX. Writes the given value as a hex number.
+-- This is based on the specification version 1.7.
+-- Supports DAT syntax same as das.
+-- It also includes the nonstandard but handy HCF "halt and catch fire" instruction (compiled as extended opcode 7).
 
 import Data.Word
 import Data.Char
@@ -18,6 +15,7 @@ import Data.List
 
 import System.IO
 import System.Environment (getArgs)
+import System.Exit
 import Data.Binary.Put
 import qualified Data.ByteString.Lazy as B
 
@@ -38,20 +36,15 @@ import Debug.Trace
 -- Assemble into binary rep and log label locations.
 -- Write completed binary rep, resolving labels from the dictionary as it goes.
 
-data Arg = Reg Word16 | RegAddr Word16 | LitAddr Word16 | LitAndReg Word16 Word16 | Lit Word16 | LabelUse String | LabelAddr String | Peek | Push | Pop | SP | PC | O | Nil
+data Arg = Reg Word16 | RegAddr Word16 | LitAddr Word16 | LitAndReg Word16 Word16 | Lit Word16 | LabelUse String | LabelAddr String | Peek | Push | Pop | SP | PC | EX | Nil | Expr Arg String Arg
   deriving (Show)
 
 data Asm = LabelDef String
          | Instr String Arg Arg
          | Blank
          | LitWord Word16
+         | LitString String
          | LitLabel String
-         | LitASCII String
-         | Symbol String [Word16]
-         | VarLabel String String -- for setting the value of an assembler .var to a label
-         | VarLit String Word16 -- for setting the value of an assembler .var to a literal
-         | Array Word16 -- array with given size
-         | ArrayLabel Word16 String -- array with given size and label for a symbol holding its data
   deriving (Show)
 
 
@@ -59,69 +52,41 @@ showHex :: Word16 -> String
 showHex x = printf "%04x" x
 
 -- parses a label: begins with a letter or underscore, continues with a letter, number or underscore.
-pl = (:) <$> (oneOf "_-" <|> letter) <*> many (oneOf "_-" <|> alphaNum)
+pl = (:) <$> (oneOf "_-" <|> letter) <*> many (oneOf "_-." <|> alphaNum)
 
-parser = many $ do
-  x <- try pComment <|> pDirective <|> pLine
+parser = fmap concat $ many $ do
+  x <- try pComment <|> try pDAT <|> pLine
   spaces
   return x
 
 pWS = skipMany (oneOf " \t\r")
 
-pComment = pWS *> char ';' *> manyTill anyChar (try newline) *> pure Blank
+pComment = pWS *> char ';' *> manyTill anyChar (try newline) *> pure [Blank]
 
 
-pDirective = do
-    char '.'
-    x <- try pASCII <|> pArray <|> pWord <|> pSymbol <|> pVar
+pDAT = do
     spaces
-    return x
+    string "DAT "
+    xs <- sepBy (try pASCII <|> pNumber <|> pLitLabel) (pWS >> char ',' >> pWS >> return ())
+    spaces
+    return xs
   where pASCII = do
-          string "ascii" >> space >> pWS
           char '"'
           x <- many (noneOf "\"")
           char '"'
-          return $ LitASCII x
-        pArray = do
-          string "array" >> space >> pWS
-          len <- read <$> many1 digit
-          space >> pWS
-          mlabel <- optionMaybe pl
-          return $ case mlabel of 
-                     Just label -> ArrayLabel len label
-                     Nothing    -> Array len
-        pWord = do
-          string "word" >> space >> pWS
-          pNumber <|> pLitLabel
+          return $ LitString x
         pNumber = do
           Lit word <- pLit
           return $ LitWord word
         pLitLabel = LitLabel <$> pl
-        pSymbol = do
-          string "sym"
-          space >> pWS
-          name <- pl
-          space >> pWS
-          values_ <- sepBy1 pLit (many1 (oneOf " \t\r"))
-          let values = map (\(Lit x) -> x) values_
-          return $ Symbol name values
-        pVar = do
-          string "var"
-          space >> pWS
-          name <- pl
-          space >> pWS
-          value_ <- pNumber <|> pLitLabel
-          case value_ of
-            LitWord w -> return $ VarLit name w
-            LitLabel label -> return $ VarLabel name label
-
 
 pLine = try pLabel <|> pInstr
 
 pLabel = do
   pWS
   char ':'
-  LabelDef <$> pl
+  l <- pl
+  return [LabelDef l]
 
 pInstr = try pRegInstr <|> pExtInstr
 
@@ -136,7 +101,7 @@ pRegInstr = do
   b <- pArg
   pWS
   optional (try pComment)
-  return $ Instr op a b
+  return [Instr op a b]
 
 pExtInstr = do
   pWS
@@ -145,30 +110,52 @@ pExtInstr = do
   pWS
   a <- pArg
   optional (try pComment)
-  return $ Instr op a Nil
+  return [Instr op a Nil]
 
 
 pOpcode =  try (string "SET")
        <|> try (string "ADD")
        <|> try (string "SUB")
        <|> try (string "MUL")
+       <|> try (string "MLI")
        <|> try (string "DIV")
+       <|> try (string "DVI")
        <|> try (string "MOD")
+       <|> try (string "MDI")
        <|> try (string "SHL")
        <|> try (string "SHR")
+       <|> try (string "ASR")
        <|> try (string "AND")
        <|> try (string "BOR")
        <|> try (string "XOR")
        <|> try (string "IFE")
        <|> try (string "IFN")
        <|> try (string "IFG")
-       <|> string "IFB"
+       <|> try (string "IFL")
+       <|> try (string "IFC")
+       <|> try (string "IFA")
+       <|> try (string "IFU")
+       <|> try (string "IFB")
+       <|> try (string "ADX")
+       <|> try (string "SBX")
+       <|> try (string "STI")
+       <|> string "STD"
 
-pExtOpcode = string "JSR" <|> string "DIE" <|> string "INP" <|> string "OUT" <|> string "HEX" <|> string "BRK" <|> string "RND"
+pExtOpcode =  try (string "JSR")
+          <|> try (string "INT")
+          <|> try (string "IAG")
+          <|> try (string "IAS")
+          <|> try (string "RFI")
+          <|> try (string "IAQ")
+          <|> try (string "HWN")
+          <|> try (string "HWQ")
+          <|> try (string "HWI")
+          <|> string "HCF"
+
 
 
 -- several different kinds of arguments
-pArg = try pReg <|> try pRegAddr <|> try pLitAndReg <|> try pLitAddr <|> try pPeek <|> try pPush <|> try pPop <|> try pSP <|> try pPC <|> try pO <|> try pLit <|> pLabelUse
+pArg = try pReg <|> try pRegAddr <|> try pLitAndReg <|> try pLitAddr <|> try pPeek <|> try pPush <|> try pPop <|> try pSP <|> try pPC <|> try pEX <|> try pLit <|> pLabelUse
 
 pReg = do
   r <- oneOf "ABCXYZIJ"
@@ -204,7 +191,7 @@ pPush = string "PUSH" >> return Push
 pPop  = string "POP"  >> return Pop
 pSP   = string "SP"   >> return SP
 pPC   = string "PC"   >> return PC
-pO    = char 'O'      >> return O
+pEX   = string "EX"   >> return EX
 
 pLit = do
   hex <- not.null <$> option "" (try $ string "0x")
@@ -233,17 +220,12 @@ parseFile s = do
     Right x  -> return x
 
 
-data Bin = W Word16 | LD String | LU String | S String [Word16] | VLit String Word16 | VLabel String String | A Word16 | AL Word16 String
+data Bin = W Word16 | LD String | LU String
 
 instance Show Bin where
-  show (W w) = showHex w
-  show (LD s) = "LD " ++ s
-  show (LU s) = "LU " ++ s
-  show (S s v) = "S " ++ s ++ ": " ++ unwords (map showHex v)
-  show (VLit s v) = "VLit " ++ s ++ ": " ++ showHex v
-  show (VLabel s l) = "VLabel " ++ s ++ ": " ++ l
-  show (A len) = "A[" ++ show len ++ "]"
-  show (AL len label) = "AL[" ++ show len ++ "] " ++ label
+    show (W w) = showHex w
+    show (LD s) = "LD " ++ s
+    show (LU s) = "LU " ++ s
 
 -- almost raw bytes here, just with markers for label definitions and placeholders for label uses.
 buildBinary :: [Asm] -> [Bin]
@@ -252,45 +234,56 @@ buildBinary = concatMap assemble
 assemble :: Asm -> [Bin]
 assemble (LabelDef x) = [LD x]
 assemble Blank = []
-assemble (Instr op a Nil) = let (d, x) = assembleArg a 
-                            in  [W $ shiftL d 10 .|. shiftL (assembleExtOp op) 4] ++ x
+assemble (Instr op a Nil) = let (d, x) = assembleArg a
+                            in  [W $ shiftL d 10 .|. shiftL (assembleExtOp op) 5] ++ x
 assemble (Instr op a b) = let (dA, xA) = assembleArg a
                               (dB, xB) = assembleArg b
-                          in  [W $ shiftL dB 10 .|. shiftL dA 4 .|. assembleOp op] ++ xA ++ xB
+                          in  [W $ shiftL dB 10 .|. shiftL dA 5 .|. assembleOp op] ++ xB ++ xA
 assemble (LitWord w) = [W w]
 assemble (LitLabel label) = [LU label]
-assemble (LitASCII s) = map (W . fromIntegral . ord) s
-assemble (Symbol s v) = [S s v]
-assemble (VarLit s v) = [VLit s v]
-assemble (VarLabel s label) = [VLabel s label]
-assemble (Array len) = [A len]
-assemble (ArrayLabel len label) = [AL len label]
+assemble (LitString s) = map (W . fromIntegral . ord) s
 
 
 assembleExtOp "JSR" = 0x01
-assembleExtOp "DIE" = 0x02
-assembleExtOp "INP" = 0x03
-assembleExtOp "OUT" = 0x04
-assembleExtOp "HEX" = 0x05
-assembleExtOp "BRK" = 0x06
-assembleExtOp "RND" = 0x07
+assembleExtOp "HCF" = 0x07
+assembleExtOp "INT" = 0x08
+assembleExtOp "IAG" = 0x09
+assembleExtOp "IAS" = 0x0a
+assembleExtOp "RFI" = 0x0b
+assembleExtOp "IAQ" = 0x0c
+assembleExtOp "HWN" = 0x10
+assembleExtOp "HWQ" = 0x11
+assembleExtOp "HWI" = 0x12
 
 
 assembleOp "SET" = 0x01
 assembleOp "ADD" = 0x02
 assembleOp "SUB" = 0x03
 assembleOp "MUL" = 0x04
-assembleOp "DIV" = 0x05
-assembleOp "MOD" = 0x06
-assembleOp "SHL" = 0x07
-assembleOp "SHR" = 0x08
-assembleOp "AND" = 0x09
-assembleOp "BOR" = 0x0a
-assembleOp "XOR" = 0x0b
-assembleOp "IFE" = 0x0c
-assembleOp "IFN" = 0x0d
-assembleOp "IFG" = 0x0e
-assembleOp "IFB" = 0x0f
+assembleOp "MLI" = 0x05
+assembleOp "DIV" = 0x06
+assembleOp "DVI" = 0x07
+assembleOp "MOD" = 0x08
+assembleOp "MDI" = 0x09
+assembleOp "AND" = 0x0a
+assembleOp "BOR" = 0x0b
+assembleOp "XOR" = 0x0c
+assembleOp "SHR" = 0x0d
+assembleOp "ASR" = 0x0e
+assembleOp "SHL" = 0x0f
+assembleOp "IFB" = 0x10
+assembleOp "IFC" = 0x11
+assembleOp "IFE" = 0x12
+assembleOp "IFN" = 0x13
+assembleOp "IFG" = 0x14
+assembleOp "IFA" = 0x15
+assembleOp "IFL" = 0x16
+assembleOp "IFU" = 0x17
+assembleOp "ADX" = 0x1a
+assembleOp "SBX" = 0x1b
+assembleOp "STI" = 0x1e
+assembleOp "STD" = 0x1f
+
 
 
 -- returns the 6-bit (unshifted) argument description that goes in the opcode word, and a list of Bin values to follow the opcode word.
@@ -300,69 +293,63 @@ assembleArg (RegAddr r) = (r+0x08, []) -- [A]
 assembleArg (LitAndReg a r) = (r+0x10, [W a]) -- [0x1000 + A]
 assembleArg (LitAddr a) = (0x1e, [W a])       -- [0x1000]
 assembleArg (LabelAddr label) = (0x1e, [LU label]) -- [label]
-assembleArg (Lit w) | w < 0x20  = (w + 0x20, []) -- inline literal
-                    | otherwise = (0x1f, [W w])  -- next word literal
+assembleArg (Lit w) | w <  0x1f   = (w + 0x21, []) -- inline literal
+                    | w == 0xffff = (0x20, [])   -- special case for -1
+                    | otherwise   = (0x1f, [W w])  -- next word literal
 assembleArg (LabelUse label) = (0x1f, [LU label])
 assembleArg Pop  = (0x18, [])
 assembleArg Peek = (0x19, [])
 assembleArg Push = (0x1a, [])
 assembleArg SP   = (0x1b, [])
 assembleArg PC   = (0x1c, [])
-assembleArg O    = (0x1d, [])
+assembleArg EX   = (0x1d, [])
 
 
 
--- returns a map of labels to their values
-populateLabels :: [Bin] -> Map String [Word16]
-populateLabels = pop' M.empty 0
-  where pop' labels addr [] = labels
-        pop' labels addr (LD label : bins) = pop' (M.insert label [addr] labels) addr bins
-        pop' labels addr (W w : bins) = pop' labels (addr+1) bins
-        pop' labels addr (LU label : bins) = pop' labels (addr+1) bins
-        pop' labels addr (S label values : bins) = pop' (M.insert label values labels) addr bins
-        pop' labels addr (VLit _ _ : bins) = pop' labels addr bins
-        pop' labels addr (VLabel _ _ : bins) = pop' labels addr bins
-        pop' labels addr (A len : bins) = pop' labels (addr+len) bins
-        pop' labels addr (AL len _ : bins) = pop' labels (addr+len) bins
+-- Given the binary and the base for relocation, returns a map of labels to their values
+populateLabels :: [Bin] -> Word16 -> Map String [Word16]
+populateLabels = pop' M.empty
+  where pop' labels [] _ = labels
+        pop' labels (LD label : bins) addr = pop' (M.insert label [addr] labels) bins addr
+        pop' labels (W w : bins) addr = pop' labels bins (addr+1)
+        pop' labels (LU label : bins) addr = pop' labels bins (addr+1)
 
+-- Given the binary, returns a list of all the locations where a label is stored, relative to the beginning of the code.
+labelUses :: [Bin] -> [Word16]
+labelUses bin = pop' [] bin 0
+  where pop' uses [] _ = uses
+        pop' uses (LD _ : bins) addr = pop' uses bins addr
+        pop' uses (W _ : bins) addr = pop' uses bins (addr+1)
+        pop' uses (LU label : bins) addr = pop' (addr : uses) bins (addr+1)
 
 
 rawCode :: [Bin] -> Map String [Word16] -> [Word16]
-rawCode bins labels = concat . snd $ mapAccumL raw M.empty bins
-  where raw vars (LD _) = (vars, [])
-        raw vars (W w) = (vars, [w])
-        raw vars (LU label) = case M.lookup label vars of
-                                Just a  -> (vars, [a])
-                                Nothing -> case M.lookup label labels of
-                                             Just a  -> (vars, a)
-                                             Nothing -> error $ "Unknown label/variable: '" ++ label ++ "'"
-        raw vars (S _ _) = (vars, [])
-        raw vars (VLit s v) = (M.insert s v vars, [])
-        raw vars (VLabel s v) = case M.lookup v vars of
-                                  Just a -> (M.insert s a vars, [])
-                                  Nothing -> case M.lookup v labels of
-                                               Just [a] -> (M.insert s a vars, [])
-                                               Just _ -> error $ "Label contents too long to fit in variable."
-                                               Nothing -> error $ "Unknown label/variable: '" ++ v ++ "'"
-        raw vars (AL len label) = case M.lookup label labels of
-                                    Just a  -> (vars, a)
-                                    Nothing -> error $ "Unknown label: '" ++ label ++ "'"
-        raw vars (A len) = (vars, replicate (fromIntegral len) 0)
+rawCode bins labels = concatMap raw bins
+  where raw (LD _) = []
+        raw (W w)  = [w]
+        raw (LU label) = case M.lookup label labels of
+                             Just a  -> a
+                             Nothing -> error $ "Unknown label: '" ++ label ++ "'"
 
 
 main :: IO ()
 main = do
-  [asmFile, outFile] <- getArgs
+  args <- getArgs
+  (relocate, asmFile, outFile) <- case args of
+      ["-r", asmFile, outFile] -> return (True, asmFile, outFile)
+      [a, asmFile, outFile]    -> hPutStrLn stderr ("Unknown argument: " ++ a) >> exitWith (ExitFailure 1)
+      [asmFile, outFile]       -> return (False, asmFile, outFile)
   asm <- parseFile asmFile
   let bin = buildBinary asm
-      labels = populateLabels bin
+      relocs = labelUses bin
+      relocCount = genericLength relocs + 5
+  print relocCount
+  let labels = populateLabels bin (if relocate then relocCount else 0)
       code = rawCode bin labels
-      (_, bs) = runPutM $ mapM putWord16be code
-  --print asm
-  --print labels
-  h <- openFile "labels.out" WriteMode
-  mapM_ (\(k,v) -> hPutStrLn h $ showHex (head v) ++ " " ++ k) (M.assocs labels)
-  hFlush h
+      relocCode = if relocate
+            then [0x7f81, relocCount, 0x5254, 0x0001, relocCount-2] ++ map (+relocCount) relocs
+            else []
+      (_, bs) = runPutM $ mapM putWord16be (relocCode ++ code)
   B.writeFile outFile bs
 
 
