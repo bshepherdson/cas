@@ -368,11 +368,9 @@ main = do
       [a, asmFile, outFile]    -> hPutStrLn stderr ("Unknown argument: " ++ a) >> exitWith (ExitFailure 1)
       [asmFile, outFile]       -> return (False, asmFile, outFile)
   asm <- parseFile asmFile
-  print asm
   let bin = buildBinary asm
       relocs = labelUses bin
       relocCount = genericLength relocs + 5
-  print relocCount
   let labels = populateLabels bin (if relocate then relocCount else 0)
       code = rawCode bin labels
       relocCode = if relocate
