@@ -36,7 +36,7 @@ import Debug.Trace
 -- Assemble into binary rep and log label locations.
 -- Write completed binary rep, resolving labels from the dictionary as it goes.
 
-data Arg = Reg Word16 | RegAddr Word16 | LitAddr Word16 | LitAndReg Word16 Word16 | Lit Word16 | LabelUse String | LabelAddr String | Peek | Push | Pop | Pick Word16 | SP | PC | EX | Nil
+data Arg = Reg Word16 | RegAddr Word16 | LitAddr Word16 | LitAndReg Word16 Word16 | LabelAndReg String Word16 | Lit Word16 | LabelUse String | LabelAddr String | Peek | Push | Pop | Pick Word16 | SP | PC | EX | Nil
   deriving (Show)
 
 data Asm = LabelDef String
@@ -173,14 +173,16 @@ brackets = between (char '[') (char ']')
 pLitAndReg = do
   char '['
   spaces
-  Lit lit <- pLit
+  val <- pLit <|> pLabelUse
   spaces
   char '+'
   spaces
   Reg reg <- pReg
   spaces
   char ']'
-  return $ LitAndReg lit reg
+  case val of
+    Lit lit -> return $ LitAndReg lit reg
+    LabelUse lu -> return $ LabelAndReg lu reg
 
 pRegAndLit = do
   char '['
@@ -189,10 +191,13 @@ pRegAndLit = do
   spaces
   char '+'
   spaces
-  Lit lit <- pLit
+  val <- pLit <|> pLabelUse
   spaces
   char ']'
-  return $ LitAndReg lit reg
+  case val of
+    Lit lit -> return $ LitAndReg lit reg
+    LabelUse lu -> return $ LabelAndReg lu reg
+
 
 pLitAddr = do
   content <- brackets (pLit <|> pLabelUse)
@@ -312,6 +317,7 @@ assembleArg :: Arg -> (Word16, [Bin])
 assembleArg (Reg r) = (r, []) -- A
 assembleArg (RegAddr r) = (r+0x08, []) -- [A]
 assembleArg (LitAndReg a r) = (r+0x10, [W a]) -- [0x1000 + A]
+assembleArg (LabelAndReg l r) = (r+0x10, [LU l]) -- [someLabel + A]
 assembleArg (LitAddr a) = (0x1e, [W a])       -- [0x1000]
 assembleArg (LabelAddr label) = (0x1e, [LU label]) -- [label]
 assembleArg (Lit w) | w <  0x1f   = (w + 0x21, []) -- inline literal
